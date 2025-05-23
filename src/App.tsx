@@ -44,7 +44,7 @@ function App() {
             <Navbar />
             <div className="flex flex-1 overflow-hidden">
               <Sidebar />
-              <main className="flex-1 overflow-y-auto p-4 md:p-6">
+              <main className="flex-1 overflow-y-auto p-4 md:p-6 md:ml-64">
                 <Suspense fallback={<PageFallback />}>
                   <Routes>
                     <Route path="/" element={<HomePage />} />
