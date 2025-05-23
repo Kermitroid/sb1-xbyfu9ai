@@ -5,10 +5,10 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs'; // Keep existing fs for any sync operations if needed elsewhere
+// import fs from 'fs'; // Removed as fsp is used for async operations
 import fsp from 'fs/promises'; // For async file operations
 import os from 'os';
-import path from 'path'; // Ensure path is explicitly imported if used heavily, though it's a core module
+// path is already imported above
 import { v4 as uuidv4 } from 'uuid';
 import admin from 'firebase-admin';
 import ffmpeg from 'fluent-ffmpeg';
@@ -467,6 +467,74 @@ app.post('/api/users/login', (req, res) => {
   res.status(501).json({ 
     message: "Login should be handled client-side using Firebase SDK. Backend verifies ID tokens on authenticated routes." 
   });
+});
+
+// GET videos by a specific user
+app.get('/api/users/:userId/videos', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+
+    // 1. Fetch user data
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    const userResponse = {
+      uid: userDoc.id,
+      username: userData.username || 'Anonymous', // Fallback if username not set
+      profilePic: userData.profilePic || null,   // Fallback if profilePic not set
+    };
+
+    // 2. Construct base query for videos
+    let videosQuery = db.collection('videos')
+                        .where('uploaderId', '==', userId)
+                        .orderBy('uploadDate', 'desc');
+
+    // 3. Get total count for pagination
+    const countSnapshot = await videosQuery.count().get();
+    const totalVideos = countSnapshot.data().count;
+    const totalPages = Math.ceil(totalVideos / limit);
+
+    if (page > totalPages && totalVideos > 0) { // Allow page 1 for 0 videos
+        return res.status(404).json({ error: 'Page out of bounds' });
+    }
+    
+    // 4. Apply pagination
+    if (page > 1) {
+      const previousPageLimit = (page - 1) * limit;
+      const previousPageSnapshot = await videosQuery.limit(previousPageLimit).get();
+      if (previousPageSnapshot.docs.length > 0) {
+          const lastVisible = previousPageSnapshot.docs[previousPageSnapshot.docs.length -1];
+          videosQuery = videosQuery.startAfter(lastVisible);
+      } else {
+        // This case should ideally be caught by page > totalPages, but as a safeguard:
+        return res.status(404).json({ error: 'Page out of bounds or inconsistent data' });
+      }
+    }
+    videosQuery = videosQuery.limit(limit);
+
+    // 5. Fetch videos
+    const videosSnapshot = await videosQuery.get();
+    const videos = videosSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // 6. Send response
+    res.json({
+      videos,
+      totalVideos,
+      totalPages,
+      currentPage: page,
+      user: userResponse,
+    });
+
+  } catch (error) {
+    console.error(`Error fetching videos for user ${req.params.userId}:`, error);
+    res.status(500).json({ error: 'Failed to fetch user videos', details: error.message });
+  }
 });
 
 // Comments
