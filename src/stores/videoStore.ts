@@ -6,31 +6,46 @@ interface VideoState {
   videos: Video[];
   featuredVideos: Video[];
   currentVideo: Video | null;
+  videoCache: Map<string, Video>;
   isLoading: boolean;
   error: string | null;
   totalVideos: number;
   totalPages: number;
   currentPage: number;
+  lastFetchParams: {
+    page?: number;
+    limit?: number;
+    category?: string;
+    search?: string;
+  } | null;
   fetchVideos: (page?: number, limit?: number, category?: string, search?: string) => Promise<void>;
   fetchVideoById: (id: string) => Promise<void>;
   fetchAggregatedVideos: (url: string) => Promise<Video[]>;
   uploadVideo: (formData: FormData) => Promise<Video>;
   likeVideo: (id: string) => Promise<void>;
   dislikeVideo: (id: string) => Promise<void>;
+  clearError: () => void;
+  clearVideos: () => void;
 }
 
 const useVideoStore = create<VideoState>((set, get) => ({
   videos: [],
   featuredVideos: [],
   currentVideo: null,
+  videoCache: new Map(),
   isLoading: false,
   error: null,
   totalVideos: 0,
   totalPages: 0,
   currentPage: 1,
+  lastFetchParams: null,
   
   fetchVideos: async (page = 1, limit = 20, category?: string, search?: string) => {
     set({ isLoading: true, error: null });
+    
+    const params = { page, limit, category, search };
+    const cacheKey = JSON.stringify(params);
+    
     try {
       const queryParams = new URLSearchParams();
       queryParams.append('page', page.toString());
@@ -41,11 +56,19 @@ const useVideoStore = create<VideoState>((set, get) => ({
       
       const response = await api.get<PaginatedResponse<Video>>(`/videos?${queryParams.toString()}`);
       
+      // Update cache with fetched videos
+      const videoCache = get().videoCache;
+      response.data.videos.forEach(video => {
+        videoCache.set(video.id, video);
+      });
+      
       set({ 
         videos: response.data.videos,
         totalVideos: response.data.totalVideos,
         totalPages: response.data.totalPages,
         currentPage: response.data.currentPage,
+        lastFetchParams: params,
+        videoCache,
         isLoading: false 
       });
       
@@ -56,23 +79,47 @@ const useVideoStore = create<VideoState>((set, get) => ({
           .slice(0, 5);
         set({ featuredVideos: featured });
       }
-    } catch (error) {
+    } catch (error: any) {
+      const errorMessage = error?.response?.data?.error || 
+                          error?.message || 
+                          'Failed to fetch videos';
       set({ 
         isLoading: false, 
-        error: error instanceof Error ? error.message : 'Failed to fetch videos' 
+        error: errorMessage
       });
     }
   },
   
   fetchVideoById: async (id: string) => {
     set({ isLoading: true, error: null });
+    
+    // Check cache first
+    const videoCache = get().videoCache;
+    const cachedVideo = videoCache.get(id);
+    
+    if (cachedVideo) {
+      set({ currentVideo: cachedVideo, isLoading: false });
+      return;
+    }
+    
     try {
       const response = await api.get<Video>(`/videos/${id}`);
-      set({ currentVideo: response.data, isLoading: false });
-    } catch (error) {
+      
+      // Update cache
+      videoCache.set(id, response.data);
+      
+      set({ 
+        currentVideo: response.data, 
+        videoCache,
+        isLoading: false 
+      });
+    } catch (error: any) {
+      const errorMessage = error?.response?.data?.error || 
+                          error?.message || 
+                          'Failed to fetch video';
       set({ 
         isLoading: false, 
-        error: error instanceof Error ? error.message : 'Failed to fetch video' 
+        error: errorMessage
       });
     }
   },
@@ -82,10 +129,13 @@ const useVideoStore = create<VideoState>((set, get) => ({
     try {
       const response = await api.get<{ videos: Video[] }>(`/aggregate?url=${encodeURIComponent(url)}`);
       return response.data.videos;
-    } catch (error) {
+    } catch (error: any) {
+      const errorMessage = error?.response?.data?.error || 
+                          error?.message || 
+                          'Failed to aggregate videos';
       set({ 
         isLoading: false, 
-        error: error instanceof Error ? error.message : 'Failed to aggregate videos' 
+        error: errorMessage
       });
       return [];
     } finally {
@@ -102,30 +152,45 @@ const useVideoStore = create<VideoState>((set, get) => ({
         }
       });
       
-      // Add the new video to the videos array
-      const videos = get().videos;
-      set({ videos: [response.data, ...videos], isLoading: false });
+      // Add the new video to the videos array and cache
+      const { videos, videoCache } = get();
+      videoCache.set(response.data.id, response.data);
+      
+      set({ 
+        videos: [response.data, ...videos], 
+        videoCache,
+        isLoading: false 
+      });
       
       return response.data;
-    } catch (error) {
+    } catch (error: any) {
+      const errorMessage = error?.response?.data?.error || 
+                          error?.response?.data?.details?.[0]?.msg ||
+                          error?.message || 
+                          'Failed to upload video';
       set({ 
         isLoading: false, 
-        error: error instanceof Error ? error.message : 'Failed to upload video' 
+        error: errorMessage
       });
       throw error;
     }
   },
   
   likeVideo: async (id: string) => {
-    const currentVideo = get().currentVideo;
+    const { currentVideo, videoCache } = get();
     if (!currentVideo || currentVideo.id !== id) return;
     
     // Optimistic update
+    const updatedVideo = {
+      ...currentVideo,
+      likes: currentVideo.likes + 1
+    };
+    
+    // Update cache and current video
+    videoCache.set(id, updatedVideo);
     set({
-      currentVideo: {
-        ...currentVideo,
-        likes: currentVideo.likes + 1
-      }
+      currentVideo: updatedVideo,
+      videoCache
     });
     
     // In a real app, we would make an API call here
@@ -133,19 +198,41 @@ const useVideoStore = create<VideoState>((set, get) => ({
   },
   
   dislikeVideo: async (id: string) => {
-    const currentVideo = get().currentVideo;
+    const { currentVideo, videoCache } = get();
     if (!currentVideo || currentVideo.id !== id) return;
     
     // Optimistic update
+    const updatedVideo = {
+      ...currentVideo,
+      dislikes: currentVideo.dislikes + 1
+    };
+    
+    // Update cache and current video
+    videoCache.set(id, updatedVideo);
     set({
-      currentVideo: {
-        ...currentVideo,
-        dislikes: currentVideo.dislikes + 1
-      }
+      currentVideo: updatedVideo,
+      videoCache
     });
     
     // In a real app, we would make an API call here
     // await api.post(`/videos/${id}/dislike`);
+  },
+
+  clearError: () => {
+    set({ error: null });
+  },
+
+  clearVideos: () => {
+    set({ 
+      videos: [], 
+      featuredVideos: [], 
+      currentVideo: null,
+      videoCache: new Map(),
+      totalVideos: 0,
+      totalPages: 0,
+      currentPage: 1,
+      lastFetchParams: null
+    });
   }
 }));
 

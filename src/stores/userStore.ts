@@ -5,18 +5,21 @@ import api from '../utils/api';
 
 interface UserState {
   user: User | null;
+  token: string | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   error: string | null;
   login: (email: string, password: string) => Promise<void>;
   register: (username: string, email: string, password: string) => Promise<void>;
   logout: () => void;
+  clearError: () => void;
 }
 
 const useUserStore = create<UserState>()(
   persist(
     (set) => ({
       user: null,
+      token: null,
       isAuthenticated: false,
       isLoading: false,
       error: null,
@@ -25,16 +28,24 @@ const useUserStore = create<UserState>()(
         set({ isLoading: true, error: null });
         try {
           const response = await api.post('/users/login', { email, password });
+          const { user, token } = response.data;
           set({ 
-            user: response.data, 
+            user, 
+            token,
             isAuthenticated: true, 
-            isLoading: false 
+            isLoading: false,
+            error: null
           });
-        } catch (error) {
+        } catch (error: any) {
+          const errorMessage = error.response?.data?.error || 
+                              error.response?.data?.details?.[0]?.msg ||
+                              error.message || 
+                              'Login failed';
           set({ 
             isLoading: false, 
-            error: error instanceof Error ? error.message : 'Login failed' 
+            error: errorMessage
           });
+          throw error; // Re-throw for component handling
         }
       },
       
@@ -42,21 +53,33 @@ const useUserStore = create<UserState>()(
         set({ isLoading: true, error: null });
         try {
           const response = await api.post('/users/register', { username, email, password });
+          const { user, token } = response.data;
           set({ 
-            user: response.data, 
+            user, 
+            token,
             isAuthenticated: true, 
-            isLoading: false 
+            isLoading: false,
+            error: null
           });
-        } catch (error) {
+        } catch (error: any) {
+          const errorMessage = error.response?.data?.error || 
+                              error.response?.data?.details?.[0]?.msg ||
+                              error.message || 
+                              'Registration failed';
           set({ 
             isLoading: false, 
-            error: error instanceof Error ? error.message : 'Registration failed' 
+            error: errorMessage
           });
+          throw error; // Re-throw for component handling
         }
       },
       
       logout: () => {
-        set({ user: null, isAuthenticated: false });
+        set({ user: null, token: null, isAuthenticated: false, error: null });
+      },
+
+      clearError: () => {
+        set({ error: null });
       }
     }),
     {
