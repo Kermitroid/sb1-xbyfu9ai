@@ -2,21 +2,78 @@ import express from 'express';
 import axios from 'axios';
 import cheerio from 'cheerio';
 import cors from 'cors';
+import helmet from 'helmet';
+import compression from 'compression';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcrypt';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 
+import { config } from './config/index.js';
+import { authenticateToken, optionalAuth, generateToken } from './middleware/auth.js';
+import { 
+  validateRegistration, 
+  validateLogin, 
+  validateVideoUpload, 
+  validateComment,
+  handleValidationErrors 
+} from './middleware/validation.js';
+import { logger, requestLogger } from './utils/logger.js';
+import { db } from './utils/database.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Security middleware
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      mediaSrc: ["'self'"],
+    },
+  },
+}));
+
+// Compression for better performance
+app.use(compression());
+
+// CORS with proper configuration
+app.use(cors({
+  origin: config.allowedOrigins,
+  credentials: true,
+  optionsSuccessStatus: 200
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: config.rateLimitWindow * 60 * 1000, // 15 minutes
+  max: config.rateLimitMaxRequests, // limit each IP to 100 requests per windowMs
+  message: {
+    error: 'Too many requests from this IP, please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/', limiter);
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Request logging
+app.use(requestLogger);
 
 // Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
+const uploadsDir = path.resolve(config.uploadPath);
 const thumbnailsDir = path.join(uploadsDir, 'thumbnails');
 
 if (!fs.existsSync(uploadsDir)) {
@@ -37,31 +94,64 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = uuidv4();
-    cb(null, uniqueSuffix + path.extname(file.originalname));
+    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    cb(null, `${uniqueSuffix}_${sanitizedName}`);
   }
 });
+
+// Enhanced file filter with better security
+const fileFilter = (req, file, cb) => {
+  const allowedVideoTypes = [
+    'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo',
+    'video/webm', 'video/ogg', 'video/3gpp', 'video/x-flv'
+  ];
+  
+  const allowedImageTypes = [
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'
+  ];
+
+  if (file.fieldname === 'video') {
+    if (!allowedVideoTypes.includes(file.mimetype)) {
+      return cb(new Error('Only video files (MP4, MOV, AVI, WebM, etc.) are allowed!'), false);
+    }
+  } else if (file.fieldname === 'thumbnail') {
+    if (!allowedImageTypes.includes(file.mimetype)) {
+      return cb(new Error('Only image files (JPEG, PNG, GIF, WebP) are allowed for thumbnails!'), false);
+    }
+  } else {
+    return cb(new Error('Unexpected field name!'), false);
+  }
+  
+  cb(null, true);
+};
 
 const upload = multer({ 
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
-  fileFilter: (req, file, cb) => {
-    if (file.fieldname === 'video') {
-      if (!file.mimetype.startsWith('video/')) {
-        return cb(new Error('Only video files are allowed!'), false);
-      }
-    } else if (file.fieldname === 'thumbnail') {
-      if (!file.mimetype.startsWith('image/')) {
-        return cb(new Error('Only image files are allowed for thumbnails!'), false);
-      }
-    }
-    cb(null, true);
-  }
+  limits: { 
+    fileSize: config.maxFileSize,
+    files: 2 // max 2 files (video + thumbnail)
+  },
+  fileFilter
 });
 
-// In-memory database for the prototype
-let videos = [];
-let users = [];
-let comments = [];
+// Load data from persistent storage
+const dbData = db.read();
+let videos = dbData.videos || [];
+let users = dbData.users || [];
+let comments = dbData.comments || [];
+
+// Start auto-save
+db.startAutoSave(() => ({
+  users,
+  videos,
+  comments
+}));
+
+logger.info('Server starting up', { 
+  videosCount: videos.length, 
+  usersCount: users.length, 
+  commentsCount: comments.length 
+});
 
 // Serve static files from the uploads directory
 app.use('/uploads', express.static(uploadsDir));
@@ -119,44 +209,59 @@ app.get('/api/aggregate', async (req, res) => {
 });
 
 // Upload a new video
-app.post('/api/videos/upload', upload.fields([
-  { name: 'video', maxCount: 1 },
-  { name: 'thumbnail', maxCount: 1 }
-]), (req, res) => {
-  try {
-    const { title, description, category, tags, userId } = req.body;
-    const videoFile = req.files['video'] ? req.files['video'][0] : null;
-    const thumbnailFile = req.files['thumbnail'] ? req.files['thumbnail'][0] : null;
+app.post('/api/videos/upload', 
+  authenticateToken,
+  upload.fields([
+    { name: 'video', maxCount: 1 },
+    { name: 'thumbnail', maxCount: 1 }
+  ]),
+  validateVideoUpload,
+  handleValidationErrors,
+  (req, res) => {
+    try {
+      const { title, description, category, tags } = req.body;
+      const videoFile = req.files['video'] ? req.files['video'][0] : null;
+      const thumbnailFile = req.files['thumbnail'] ? req.files['thumbnail'][0] : null;
 
-    if (!videoFile) {
-      return res.status(400).json({ error: 'Video file is required' });
+      if (!videoFile) {
+        return res.status(400).json({ error: 'Video file is required' });
+      }
+
+      const user = users.find(u => u.id === req.user.id);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      // Create new video entry
+      const newVideo = {
+        id: uuidv4(),
+        title: title || 'Untitled Video',
+        description: description || '',
+        category: category || 'Other',
+        tags: tags ? tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0) : [],
+        videoUrl: `/uploads/${videoFile.filename}`,
+        thumbnail: thumbnailFile ? `/uploads/thumbnails/${thumbnailFile.filename}` : null,
+        source: 'user',
+        duration: '0:00', // Would need ffmpeg to get actual duration
+        views: 0,
+        likes: 0,
+        dislikes: 0,
+        uploadDate: new Date().toISOString(),
+        userId: req.user.id,
+        user: { 
+          username: user.username, 
+          profilePic: user.profilePic 
+        }
+      };
+
+      videos.push(newVideo);
+      res.status(201).json(newVideo);
+    } catch (error) {
+      console.error('Video upload error:', error);
+      res.status(500).json({ error: 'Failed to upload video', details: error.message });
     }
-
-    // Create new video entry
-    const newVideo = {
-      id: uuidv4(),
-      title: title || 'Untitled Video',
-      description: description || '',
-      category: category || 'Uncategorized',
-      tags: tags ? tags.split(',').map(tag => tag.trim()) : [],
-      videoUrl: `/uploads/${videoFile.filename}`,
-      thumbnail: thumbnailFile ? `/uploads/thumbnails/${thumbnailFile.filename}` : null,
-      source: 'user',
-      duration: '0:00', // Would need ffmpeg to get actual duration
-      views: 0,
-      likes: 0,
-      dislikes: 0,
-      uploadDate: new Date().toISOString(),
-      userId,
-      user: users.find(u => u.id === userId) || { username: 'Anonymous' }
-    };
-
-    videos.push(newVideo);
-    res.status(201).json(newVideo);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to upload video', details: error.message });
   }
-});
+);
 
 // Get all videos (with pagination)
 app.get('/api/videos', (req, res) => {
@@ -204,82 +309,119 @@ app.get('/api/videos/:id', (req, res) => {
 });
 
 // User routes
-app.post('/api/users/register', (req, res) => {
-  const { username, email, password } = req.body;
-  
-  if (!username || !email || !password) {
-    return res.status(400).json({ error: 'Username, email and password are required' });
+app.post('/api/users/register', validateRegistration, handleValidationErrors, async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    
+    // Check if user already exists
+    if (users.some(u => u.email === email)) {
+      return res.status(400).json({ error: 'Email already in use' });
+    }
+    
+    if (users.some(u => u.username === username)) {
+      return res.status(400).json({ error: 'Username already taken' });
+    }
+    
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, config.bcryptRounds);
+    
+    const newUser = {
+      id: uuidv4(),
+      username,
+      email,
+      password: hashedPassword,
+      createdAt: new Date().toISOString(),
+      profilePic: null
+    };
+    
+    users.push(newUser);
+    
+    // Generate JWT token
+    const token = generateToken(newUser);
+    
+    const { password: _, ...userWithoutPassword } = newUser;
+    res.status(201).json({
+      user: userWithoutPassword,
+      token
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error during registration' });
   }
-  
-  if (users.some(u => u.email === email)) {
-    return res.status(400).json({ error: 'Email already in use' });
-  }
-  
-  if (users.some(u => u.username === username)) {
-    return res.status(400).json({ error: 'Username already taken' });
-  }
-  
-  const newUser = {
-    id: uuidv4(),
-    username,
-    email,
-    password, // In a real app, this would be hashed
-    createdAt: new Date().toISOString(),
-    profilePic: null
-  };
-  
-  users.push(newUser);
-  
-  const { password: _, ...userWithoutPassword } = newUser;
-  res.status(201).json(userWithoutPassword);
 });
 
-app.post('/api/users/login', (req, res) => {
-  const { email, password } = req.body;
-  
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+app.post('/api/users/login', validateLogin, handleValidationErrors, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const user = users.find(u => u.email === email);
+    
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Verify password
+    const passwordMatch = await bcrypt.compare(password, user.password);
+    
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Generate JWT token
+    const token = generateToken(user);
+    
+    const { password: _, ...userWithoutPassword } = user;
+    res.json({
+      user: userWithoutPassword,
+      token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error during login' });
   }
-  
-  const user = users.find(u => u.email === email && u.password === password);
-  
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
-  
-  const { password: _, ...userWithoutPassword } = user;
-  res.json(userWithoutPassword);
 });
 
 // Comments
-app.post('/api/videos/:id/comments', (req, res) => {
-  const { userId, content } = req.body;
-  const videoId = req.params.id;
-  
-  if (!content) {
-    return res.status(400).json({ error: 'Comment content is required' });
+app.post('/api/videos/:id/comments', 
+  authenticateToken, 
+  validateComment, 
+  handleValidationErrors, 
+  (req, res) => {
+    try {
+      const { content } = req.body;
+      const videoId = req.params.id;
+      
+      const video = videos.find(v => v.id === videoId);
+      if (!video) {
+        return res.status(404).json({ error: 'Video not found' });
+      }
+      
+      const user = users.find(u => u.id === req.user.id);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      
+      const newComment = {
+        id: uuidv4(),
+        videoId,
+        userId: req.user.id,
+        user: { 
+          username: user.username, 
+          profilePic: user.profilePic 
+        },
+        content: content.trim(),
+        createdAt: new Date().toISOString(),
+        likes: 0
+      };
+      
+      comments.push(newComment);
+      res.status(201).json(newComment);
+    } catch (error) {
+      console.error('Comment creation error:', error);
+      res.status(500).json({ error: 'Failed to create comment' });
+    }
   }
-  
-  const video = videos.find(v => v.id === videoId);
-  if (!video) {
-    return res.status(404).json({ error: 'Video not found' });
-  }
-  
-  const user = users.find(u => u.id === userId);
-  
-  const newComment = {
-    id: uuidv4(),
-    videoId,
-    userId,
-    user: user ? { username: user.username, profilePic: user.profilePic } : { username: 'Anonymous' },
-    content,
-    createdAt: new Date().toISOString(),
-    likes: 0
-  };
-  
-  comments.push(newComment);
-  res.status(201).json(newComment);
-});
+);
 
 app.get('/api/videos/:id/comments', (req, res) => {
   const videoId = req.params.id;
