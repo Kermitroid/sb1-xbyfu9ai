@@ -13,19 +13,37 @@ import { v4 as uuidv4 } from 'uuid';
 import admin from 'firebase-admin';
 import ffmpeg from 'fluent-ffmpeg';
 import ffprobeStatic from 'ffprobe-static';
+import { body, validationResult } from 'express-validator';
 
 // Set the path to ffprobe
 ffmpeg.setFfprobePath(ffprobeStatic.path);
 
+// Firebase Admin SDK Initialization
+const FIREBASE_STORAGE_BUCKET_URL = process.env.FIREBASE_STORAGE_BUCKET_URL;
+
+if (!FIREBASE_STORAGE_BUCKET_URL) {
+  console.error(
+    'FATAL ERROR: FIREBASE_STORAGE_BUCKET_URL environment variable is not set.'
+  );
+  console.error(
+    'Please set it to your Firebase project's storage bucket URL (e.g., gs://your-project-id.appspot.com or your-project-id.appspot.com).'
+  );
+  // To allow the app to potentially start for other routes or for user to see this message,
+  // we will not exit here but Firebase Storage dependent operations will fail.
+}
+
 try {
   admin.initializeApp({
-    // If GOOGLE_APPLICATION_CREDENTIALS is set, you don't need to pass credential here.
-    // For storage, specify the bucket name if it's not automatically derived or if you have multiple.
-    storageBucket: '<YOUR_FIREBASE_STORAGE_BUCKET_URL>' // Get this from your Firebase project settings.
+    // GOOGLE_APPLICATION_CREDENTIALS environment variable is used implicitly for service account
+    storageBucket: FIREBASE_STORAGE_BUCKET_URL,
   });
-  console.log("Firebase Admin SDK initialized successfully.");
+  console.log('Firebase Admin SDK initialized successfully.');
+  if (!FIREBASE_STORAGE_BUCKET_URL) {
+    // This warning will appear if the app didn't exit above due to the missing env var.
+    console.warn('Warning: Firebase Storage operations will likely fail as FIREBASE_STORAGE_BUCKET_URL was not properly set.');
+  }
 } catch (error) {
-  console.error("Firebase Admin SDK initialization error:", error);
+  console.error('Firebase Admin SDK initialization error:', error);
   process.exit(1); // Exit if Firebase Admin fails to initialize
 }
 
@@ -96,6 +114,64 @@ async function verifyFirebaseToken(req, res, next) {
   }
 }
 
+// Validation rules for video upload
+const videoUploadValidationRules = [
+  body('title')
+    .optional()
+    .trim()
+    .isString().withMessage('Title must be a string.')
+    .isLength({ min: 1, max: 150 }).withMessage('Title must be between 1 and 150 characters.'),
+  body('description')
+    .optional()
+    .trim()
+    .isString().withMessage('Description must be a string.')
+    .isLength({ max: 5000 }).withMessage('Description cannot exceed 5000 characters.'),
+  body('category')
+    .optional()
+    .trim()
+    .isString().withMessage('Category must be a string.')
+    .isLength({ min: 1, max: 50 }).withMessage('Category must be between 1 and 50 characters.'),
+  body('tags')
+    .optional()
+    .isString().withMessage('Tags must be a string.')
+    .custom((value, { req }) => {
+        if (value && typeof value === 'string') {
+            const tagsArray = value.split(',').map(tag => tag.trim());
+            if (tagsArray.some(tag => tag.length > 50)) {
+                throw new Error('Individual tags cannot exceed 50 characters.');
+            }
+            if (tagsArray.length > 10) {
+                throw new Error('Cannot have more than 10 tags.');
+            }
+        }
+        return true;
+    }),
+];
+
+// Validation rules for user registration
+const userRegistrationValidationRules = [
+  body('username')
+    .trim()
+    .notEmpty().withMessage('Username is required.')
+    .isLength({ min: 3, max: 30 }).withMessage('Username must be between 3 and 30 characters.')
+    .isAlphanumeric().withMessage('Username must contain only letters and numbers.'),
+  body('email')
+    .trim()
+    .notEmpty().withMessage('Email is required.')
+    .isEmail().withMessage('Must be a valid email address.'),
+  body('password')
+    .notEmpty().withMessage('Password is required.')
+    .isLength({ min: 6 }).withMessage('Password must be at least 6 characters long.'),
+];
+
+// Validation rules for comments
+const commentValidationRules = [
+  body('content')
+    .trim()
+    .notEmpty().withMessage('Comment content cannot be empty.')
+    .isLength({ min: 1, max: 2000 }).withMessage('Comment must be between 1 and 2000 characters.'),
+];
+
 // Scrape videos from external sites
 app.get('/api/aggregate', async (req, res) => {
   const { url } = req.query;
@@ -149,13 +225,22 @@ app.get('/api/aggregate', async (req, res) => {
 });
 
 // Upload a new video
-app.post('/api/videos/upload', verifyFirebaseToken, upload.fields([
-  { name: 'video', maxCount: 1 },
-  { name: 'thumbnail', maxCount: 1 }
-]), async (req, res) => {
-  try {
-    const uploaderId = req.user.uid; // Get uploaderId from authenticated user
-    const { title, description, category, tags } = req.body; // userId no longer needed from body
+app.post('/api/videos/upload', 
+  verifyFirebaseToken, 
+  upload.fields([
+    { name: 'video', maxCount: 1 },
+    { name: 'thumbnail', maxCount: 1 }
+  ]), 
+  videoUploadValidationRules, // Apply validation rules
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+    
+    try {
+      const uploaderId = req.user.uid; // Get uploaderId from authenticated user
+      const { title, description, category, tags } = req.body; // userId no longer needed from body
     const videoFile = req.files['video'] ? req.files['video'][0] : null;
     const thumbnailFile = req.files['thumbnail'] ? req.files['thumbnail'][0] : null;
 
@@ -326,15 +411,19 @@ app.get('/api/videos/:id', async (req, res) => {
 });
 
 // User routes
-app.post('/api/users/register', async (req, res) => {
-  const { username, email, password } = req.body;
+app.post('/api/users/register', 
+  userRegistrationValidationRules, // Apply validation rules
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
 
-  if (!username || !email || !password) {
-    return res.status(400).json({ error: 'Username, email and password are required' });
-  }
+    // The old check: if (!username || !email || !password) can be removed.
+    const { username, email, password } = req.body;
 
-  try {
-    const userRecord = await admin.auth().createUser({
+    try {
+      const userRecord = await admin.auth().createUser({
       email,
       password,
       displayName: username,
@@ -381,18 +470,24 @@ app.post('/api/users/login', (req, res) => {
 });
 
 // Comments
-app.post('/api/videos/:id/comments', verifyFirebaseToken, async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    const commenterId = req.user.uid; // Get commenterId from authenticated user
-    const { content } = req.body; // userId no longer needed from body
-
-    if (!content) {
-      return res.status(400).json({ error: 'Comment content is required' });
+app.post('/api/videos/:id/comments', 
+  verifyFirebaseToken, 
+  commentValidationRules, // Apply validation rules
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
-    // Removed the commenterId check from req.body as it's now from req.user.uid
 
-    // Check if video exists
+    // The old check: if (!content) can be removed.
+    const videoId = req.params.id;
+    const commenterId = req.user.uid;
+    const { content } = req.body;
+
+    try {
+      // Removed the commenterId check from req.body as it's now from req.user.uid
+
+      // Check if video exists
     const videoRef = db.collection('videos').doc(videoId);
     const videoDoc = await videoRef.get();
     if (!videoDoc.exists) {
