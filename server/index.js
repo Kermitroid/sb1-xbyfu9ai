@@ -66,6 +66,9 @@ let comments = [];
 // Serve static files from the uploads directory
 app.use('/uploads', express.static(uploadsDir));
 
+// Serve frontend static files
+app.use(express.static(path.join(__dirname, '..', 'dist')));
+
 // Scrape videos from external sites
 app.get('/api/aggregate', async (req, res) => {
   const { url } = req.query;
@@ -289,6 +292,11 @@ app.get('/api/videos/:id/comments', (req, res) => {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   
   res.json(videoComments);
+});
+
+// Catch-all GET route to serve index.html for client-side routing
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'dist', 'index.html'));
 });
 
 // Start the server
