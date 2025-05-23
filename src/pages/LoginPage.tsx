@@ -1,26 +1,73 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Mail, Lock } from 'lucide-react';
-import useUserStore from '../stores/userStore';
+import { auth } from '../firebase'; // Import Firebase auth instance
+import useUserStore, { getIsAuthenticated } from '../stores/userStore'; // Import store and isAuthenticated helper
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const { login } = useUserStore();
+  const [isLoading, setIsLoading] = useState(false);
+
+  // Access the isLoading state from the store to see if onAuthStateChanged is still running
+  const isAuthLoading = useUserStore((state) => state.isLoading);
+
+  // Redirect if user is already logged in and auth state is resolved
+  useEffect(() => {
+    // Only redirect if auth is not loading and user is authenticated
+    if (!isAuthLoading && getIsAuthenticated()) {
+      navigate('/');
+    }
+  }, [isAuthLoading, navigate]);
+
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setIsLoading(true);
     
     try {
-      await login(email, password);
-      navigate('/');
-    } catch (err) {
-      setError('Invalid email or password');
+      await auth.signInWithEmailAndPassword(email, password);
+      // onAuthStateChanged in App.tsx will handle setting user state
+      // and redirecting or updating UI.
+      // We can navigate immediately here after successful sign-in.
+      navigate('/'); 
+    } catch (err: any) { // Use 'any' or firebase.FirebaseError
+      // Handle Firebase Auth errors
+      switch (err.code) {
+        case 'auth/user-not-found':
+          setError('No user found with this email.');
+          break;
+        case 'auth/wrong-password':
+          setError('Incorrect password. Please try again.');
+          break;
+        case 'auth/invalid-email':
+          setError('The email address is not valid.');
+          break;
+        case 'auth/invalid-credential': // Catch-all for invalid email/password combination
+          setError('Invalid credentials. Please check your email and password.');
+          break;
+        default:
+          setError('Login failed. Please check your credentials.');
+          break;
+      }
+      console.error("Login error:", err);
+    } finally {
+      setIsLoading(false);
     }
   };
+
+  // If auth state is still being determined by onAuthStateChanged, show a loading indicator or nothing.
+  // This prevents flashing the login form if the user is already logged in.
+  if (isAuthLoading) {
+    return (
+      <div className="flex min-h-[calc(100vh-4rem)] items-center justify-center px-4">
+        <div>Loading user session...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-[calc(100vh-4rem)] items-center justify-center px-4">
@@ -58,11 +105,13 @@ export default function LoginPage() {
                   id="email"
                   name="email"
                   type="email"
+                  autoComplete="email"
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   className="block w-full rounded-lg border border-dark-100 bg-dark-100 pl-10 pr-3 py-2 text-white placeholder-gray-400 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
                   placeholder="Email address"
+                  disabled={isLoading}
                 />
               </div>
             </div>
@@ -79,11 +128,13 @@ export default function LoginPage() {
                   id="password"
                   name="password"
                   type="password"
+                  autoComplete="current-password"
                   required
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   className="block w-full rounded-lg border border-dark-100 bg-dark-100 pl-10 pr-3 py-2 text-white placeholder-gray-400 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
                   placeholder="Password"
+                  disabled={isLoading}
                 />
               </div>
             </div>
@@ -92,9 +143,10 @@ export default function LoginPage() {
           <div>
             <button
               type="submit"
-              className="group relative flex w-full justify-center rounded-lg bg-primary-500 px-3 py-2 text-sm font-semibold text-white hover:bg-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2"
+              disabled={isLoading || isAuthLoading} // Also disable if global auth is still loading
+              className="group relative flex w-full justify-center rounded-lg bg-primary-500 px-3 py-2 text-sm font-semibold text-white hover:bg-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 disabled:opacity-50"
             >
-              Sign in
+              {isLoading ? 'Signing in...' : 'Sign in'}
             </button>
           </div>
         </form>

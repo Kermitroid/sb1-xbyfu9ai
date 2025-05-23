@@ -12,17 +12,46 @@ import AggregationPage from './pages/AggregationPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import useVideoStore from './stores/videoStore';
-import useUserStore from './stores/userStore';
+import useUserStore from './stores/userStore'; // Original import
 import { ThemeProvider } from './context/ThemeContext';
+
+// Firebase imports for auth listener
+import { auth } from './firebase'; // Assuming src/firebase.ts
+import firebase from 'firebase/compat/app'; // For firebase.Unsubscribe type
 
 function App() {
   const { fetchVideos } = useVideoStore();
-  const { user, isAuthenticated } = useUserStore();
+  // Get actions and relevant state from useUserStore
+  const { setUserAndToken, setLoading } = useUserStore();
 
   useEffect(() => {
     // Fetch initial videos when the app loads
     fetchVideos();
   }, [fetchVideos]);
+
+  // Setup Firebase onAuthStateChanged listener
+  useEffect(() => {
+    setLoading(true); // Start in loading state
+    const unsubscribe: firebase.Unsubscribe = auth.onAuthStateChanged(async (user) => {
+      if (user) {
+        // User is signed in
+        try {
+          const idToken = await user.getIdToken();
+          setUserAndToken(user, idToken);
+        } catch (error) {
+          console.error("Error getting ID token:", error);
+          // Handle error, maybe sign out user or set error state in store
+          setUserAndToken(null, null); // Clear user if token fetch fails
+        }
+      } else {
+        // User is signed out
+        setUserAndToken(null, null);
+      }
+    });
+
+    // Cleanup subscription on unmount
+    return () => unsubscribe();
+  }, [setUserAndToken, setLoading]); // Add dependencies
 
   return (
     <ThemeProvider>
@@ -36,7 +65,7 @@ function App() {
                 <Route path="/" element={<HomePage />} />
                 <Route path="/video/:id" element={<VideoPage />} />
                 <Route path="/upload" element={<UploadPage />} />
-                <Route path="/profile/:id" element={<ProfilePage />} />
+                <Route path="/profile/:id" element={<ProfilePage />} /> {/* Consider changing to /profile or /profile/:userId */}
                 <Route path="/search" element={<SearchPage />} />
                 <Route path="/aggregate" element={<AggregationPage />} />
                 <Route path="/login" element={<LoginPage />} />
